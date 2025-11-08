@@ -1,59 +1,147 @@
-from .utils import *
-from .main import *
+"""Inference functions for MAIA2 model.
 
-def preprocessing(fen, elo_self, elo_oppo, elo_dict, all_moves_dict):
-        
-    if fen.split(' ')[1] == 'w':
+Provides preprocessing, dataset creation, and inference utilities
+for running predictions on chess positions.
+"""
+
+from typing import Dict, List, Tuple, cast
+
+import chess
+import pandas as pd
+import torch
+import torch.utils.data
+import tqdm
+
+from .main import MAIA2Model
+from .utils import (
+    BoardPosition,
+    ChessMove,
+    EloRangeDict,
+    EloRating,
+    MovesDict,
+    ReverseMovesDict,
+    board_to_tensor,
+    create_elo_dict,
+    get_all_possible_moves,
+    map_to_category,
+    mirror_move,
+)
+
+TestDatasetItem = Tuple[BoardPosition, torch.Tensor,
+                        EloRating, EloRating, torch.Tensor]
+DictMoveProb = Dict[ChessMove, float]
+PreparedDicts = Tuple[MovesDict, EloRangeDict, ReverseMovesDict]
+DeprecatedPreparedDicts = List[(MovesDict | EloRangeDict | ReverseMovesDict)]
+
+
+def preprocessing(
+    fen: BoardPosition,
+    elo_self: EloRating,
+    elo_oppo: EloRating,
+    elo_dict: EloRangeDict,
+    all_moves_dict: MovesDict,
+) -> Tuple[torch.Tensor, EloRating, EloRating, torch.Tensor]:
+    """Preprocess FEN and Elo ratings into model tensors.
+
+    Args:
+        fen: FEN string of chess position.
+        elo_self: Elo rating of active player.
+        elo_oppo: Elo rating of opponent.
+        elo_dict: Mapping of Elo ratings to categories.
+        all_moves_dict: Mapping of moves to indices.
+
+    Returns:
+        Tuple of (board_tensor, elo_self_cat, elo_oppo_cat, legal_moves_mask).
+    """
+    if fen.split(" ")[1] == "w":
         board = chess.Board(fen)
-    elif fen.split(' ')[1] == 'b':
+    elif fen.split(" ")[1] == "b":
         board = chess.Board(fen).mirror()
     else:
         raise ValueError(f"Invalid fen: {fen}")
-        
+
     board_input = board_to_tensor(board)
-    
+
     elo_self = map_to_category(elo_self, elo_dict)
     elo_oppo = map_to_category(elo_oppo, elo_dict)
-    
-    legal_moves = torch.zeros(len(all_moves_dict))
-    legal_moves_idx = torch.tensor([all_moves_dict[move.uci()] for move in board.legal_moves])
+
+    legal_moves = torch.zeros(len(all_moves_dict), dtype=torch.float32)
+    legal_moves_idx = torch.tensor(
+        [all_moves_dict[move.uci()] for move in board.legal_moves]
+    )
     legal_moves[legal_moves_idx] = 1
-    
+
     return board_input, elo_self, elo_oppo, legal_moves
 
 
-class TestDataset(torch.utils.data.Dataset):
-    
-    def __init__(self, data, all_moves_dict, elo_dict):
-        
+class TestDataset(torch.utils.data.Dataset[TestDatasetItem]):
+    """PyTorch Dataset for MAIA2 test data."""
+
+    def __init__(
+        self,
+        data: pd.DataFrame,
+        all_moves_dict: MovesDict,
+        elo_dict: EloRangeDict,
+    ):
+        """Initialize dataset.
+
+        Args:
+            data: DataFrame with [fen, move, elo_self, elo_oppo].
+            all_moves_dict: UCI moves to model indices.
+            elo_dict: Raw Elo to binned categories.
+        """
         self.all_moves_dict = all_moves_dict
         self.data = data.values.tolist()
         self.elo_dict = elo_dict
-    
-    def __len__(self):
-        
+
+    def __len__(self) -> int:
+        """Return number of samples."""
         return len(self.data)
-    
-    def __getitem__(self, idx):
-        
+
+    def __getitem__(self, idx: int) -> TestDatasetItem:
+        """Get preprocessed tensors for position.
+
+        Args:
+            idx: Sample index.
+
+        Returns:
+            Tuple of (fen, board_tensor, elo_self_cat, elo_oppo_cat, legal_moves_mask).
+        """
         fen, _, elo_self, elo_oppo = self.data[idx]
 
-        board_input, elo_self, elo_oppo, legal_moves = preprocessing(fen, elo_self, elo_oppo, self.elo_dict, self.all_moves_dict)
-        
+        board_input, elo_self, elo_oppo, legal_moves = preprocessing(
+            fen, elo_self, elo_oppo, self.elo_dict, self.all_moves_dict
+        )
+
         return fen, board_input, elo_self, elo_oppo, legal_moves
 
-def get_preds(model, dataloader, all_moves_dict_reversed):
-    
-    move_probs = []
-    win_probs = []
-    
+
+def get_preds(
+    model: MAIA2Model,
+    dataloader: torch.utils.data.DataLoader,
+    all_moves_dict_reversed: ReverseMovesDict,
+) -> Tuple[List[DictMoveProb], List[float]]:
+    """Compute move and win probabilities for dataset.
+
+    Args:
+        model: Trained MAIA2 model.
+        dataloader: DataLoader yielding test data.
+        all_moves_dict_reversed: Move indices to UCI strings.
+
+    Returns:
+        Tuple of (move_probs_list, win_probs_list).
+        move_probs_list: List of dicts mapping UCI moves to probabilities.
+        win_probs_list: List of win probabilities.
+    """
+    move_probs: List[DictMoveProb] = []
+    win_probs: List[float] = []
+
     device = next(model.parameters()).device
-    
+
     model.eval()
+
     with torch.no_grad():
-        
         for fens, boards, elos_self, elos_oppo, legal_moves in dataloader:
-            
             boards = boards.to(device)
             elos_self = elos_self.to(device)
             elos_oppo = elos_oppo.to(device)
@@ -62,110 +150,169 @@ def get_preds(model, dataloader, all_moves_dict_reversed):
             logits_maia, _, logits_value = model(boards, elos_self, elos_oppo)
             logits_maia_legal = logits_maia * legal_moves
             probs = logits_maia_legal.softmax(dim=-1).cpu().tolist()
-            
             logits_value = (logits_value / 2 + 0.5).clamp(0, 1).cpu().tolist()
-        
-            for i in range(len(fens)):
-                
-                fen = fens[i]
+
+            for i, fen in enumerate(fens):
                 black_flag = False
-                
+
                 # calculate win probability
                 logit_value = logits_value[i]
                 if fen.split(" ")[1] == "b":
                     logit_value = 1 - logit_value
                     black_flag = True
                 win_probs.append(round(logit_value, 4))
-                
+
                 # calculate move probabilities
                 move_probs_each = {}
-                legal_move_indices = legal_moves[i].nonzero().flatten().cpu().numpy().tolist()
+                legal_move_indices = (
+                    legal_moves[i].nonzero().flatten().cpu().numpy().tolist()
+                )
                 legal_moves_mirrored = []
                 for move_idx in legal_move_indices:
                     move = all_moves_dict_reversed[move_idx]
                     if black_flag:
                         move = mirror_move(move)
                     legal_moves_mirrored.append(move)
-                
-                for j in range(len(legal_move_indices)):
-                    move_probs_each[legal_moves_mirrored[j]] = round(probs[i][legal_move_indices[j]], 4)
-                
-                move_probs_each = dict(sorted(move_probs_each.items(), key=lambda item: item[1], reverse=True))
+
+                for j, legal_move_index in enumerate(legal_move_indices):
+                    move_probs_each[legal_moves_mirrored[j]] = round(
+                        probs[i][legal_move_index], 4
+                    )
+
+                move_probs_each = dict(
+                    sorted(
+                        move_probs_each.items(), key=lambda item: item[1], reverse=True
+                    )
+                )
                 move_probs.append(move_probs_each)
-    
+
     return move_probs, win_probs
 
 
-def inference_batch(data, model, verbose, batch_size, num_workers):
+def inference_batch(
+    data: pd.DataFrame,
+    model: MAIA2Model,
+    verbose: bool,
+    batch_size: int,
+    num_workers: int,
+) -> Tuple[pd.DataFrame, float]:
+    """Run inference on batch of chess positions.
 
+    Args:
+        data: DataFrame with [fen, move, elo_self, elo_oppo].
+        model: Trained MAIA2 model.
+        verbose: Show progress bar if True.
+        batch_size: Batch size for DataLoader.
+        num_workers: Number of DataLoader workers.
+
+    Returns:
+        Tuple of (updated_dataframe, accuracy).
+        updated_dataframe: Input data with added win_probs and move_probs columns.
+        accuracy: Move prediction accuracy.
+    """
     all_moves = get_all_possible_moves()
     all_moves_dict = {move: i for i, move in enumerate(all_moves)}
     elo_dict = create_elo_dict()
-    
     all_moves_dict_reversed = {v: k for k, v in all_moves_dict.items()}
+
     dataset = TestDataset(data, all_moves_dict, elo_dict)
-    dataloader = torch.utils.data.DataLoader(dataset, 
-                                            batch_size=batch_size, 
-                                            shuffle=False, 
-                                            drop_last=False,
-                                            num_workers=num_workers)
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+        num_workers=num_workers,
+    )
+
     if verbose:
-        dataloader = tqdm.tqdm(dataloader)
-        
-    move_probs, win_probs = get_preds(model, dataloader, all_moves_dict_reversed)
-    
+        dataloader = cast(
+            torch.utils.data.DataLoader[TestDatasetItem], tqdm.tqdm(dataloader)
+        )
+
+    move_probs, win_probs = get_preds(
+        model, dataloader, all_moves_dict_reversed)
+
     data["win_probs"] = win_probs
     data["move_probs"] = move_probs
-    
+
     acc = 0
     for i in range(len(data)):
-        highest_prob_move = max(move_probs[i], key=move_probs[i].get)
+        highest_prob_move, _highest_prob = max(
+            move_probs[i].items(), key=lambda item: item[1]
+        )
+
         if highest_prob_move == data.iloc[i]["move"]:
             acc += 1
-    acc = round(acc / len(data), 4)
-    
-    return data, acc
+    accuracy = round(acc / len(data), 4)
+
+    return data, accuracy
 
 
-def prepare():
+def prepare() -> DeprecatedPreparedDicts:
+    """Initialize dictionaries for model inference.
 
+    Returns:
+        List of [all_moves_dict, elo_dict, all_moves_dict_reversed].
+        all_moves_dict: UCI moves to indices.
+        elo_dict: Raw Elo to categories.
+        all_moves_dict_reversed: Indices to UCI moves.
+    """
     all_moves = get_all_possible_moves()
     all_moves_dict = {move: i for i, move in enumerate(all_moves)}
     elo_dict = create_elo_dict()
-    
     all_moves_dict_reversed = {v: k for k, v in all_moves_dict.items()}
-    
+
     return [all_moves_dict, elo_dict, all_moves_dict_reversed]
 
 
-def inference_each(model, prepared, fen, elo_self, elo_oppo):
-    
-    all_moves_dict, elo_dict, all_moves_dict_reversed = prepared
-    
-    board_input, elo_self, elo_oppo, legal_moves = preprocessing(fen, elo_self, elo_oppo, elo_dict, all_moves_dict)
-    
+def inference_each(
+    model: MAIA2Model,
+    prepared: PreparedDicts | DeprecatedPreparedDicts,
+    fen: BoardPosition,
+    elo_self: EloRating,
+    elo_oppo: EloRating,
+) -> Tuple[DictMoveProb, float]:
+    """Analyze single chess position with MAIA2.
+
+    Args:
+        model: Trained MAIA2 model.
+        prepared: Tuple from prepare() with mapping dicts.
+        fen: FEN string of position.
+        elo_self: Elo of player to move.
+        elo_oppo: Elo of opponent.
+
+    Returns:
+        Tuple of (move_probs, win_prob).
+        move_probs: Dict mapping UCI moves to probabilities (sorted).
+        win_prob: Win probability (0-1).
+    """
+    all_moves_dict, elo_dict, all_moves_dict_reversed = cast(
+        PreparedDicts, prepared)
+    board_input, elo_self, elo_oppo, legal_moves = preprocessing(
+        fen, elo_self, elo_oppo, elo_dict, all_moves_dict
+    )
+
     device = next(model.parameters()).device
-    
     model.eval()
-    
+
     board_input = board_input.unsqueeze(dim=0).to(device)
-    elo_self = torch.tensor([elo_self]).to(device)
-    elo_oppo = torch.tensor([elo_oppo]).to(device)
+    elo_self_tensor = torch.tensor([elo_self]).to(device)
+    elo_oppo_tensor = torch.tensor([elo_oppo]).to(device)
     legal_moves = legal_moves.unsqueeze(dim=0).to(device)
-    
-    logits_maia, _, logits_value = model(board_input, elo_self, elo_oppo)
+
+    logits_maia, _, logits_value = model(
+        board_input, elo_self_tensor, elo_oppo_tensor)
     logits_maia_legal = logits_maia * legal_moves
     probs = logits_maia_legal.softmax(dim=-1).cpu().tolist()
-    
     logits_value = (logits_value / 2 + 0.5).clamp(0, 1).item()
-    
+
     black_flag = False
     if fen.split(" ")[1] == "b":
         logits_value = 1 - logits_value
         black_flag = True
     win_prob = round(logits_value, 4)
-    
-    move_probs = {}
+
+    move_probs: DictMoveProb = {}
     legal_move_indices = legal_moves.nonzero().flatten().cpu().numpy().tolist()
     legal_moves_mirrored = []
     for move_idx in legal_move_indices:
@@ -173,11 +320,13 @@ def inference_each(model, prepared, fen, elo_self, elo_oppo):
         if black_flag:
             move = mirror_move(move)
         legal_moves_mirrored.append(move)
-    
-    for j in range(len(legal_move_indices)):
-        move_probs[legal_moves_mirrored[j]] = round(probs[0][legal_move_indices[j]], 4)
-    
-    move_probs = dict(sorted(move_probs.items(), key=lambda item: item[1], reverse=True))
-    
-    return move_probs, win_prob
 
+    for j, legal_move_index in enumerate(legal_move_indices):
+        move_probs[legal_moves_mirrored[j]] = round(
+            probs[0][legal_move_index], 4)
+
+    move_probs = dict(
+        sorted(move_probs.items(), key=lambda item: item[1], reverse=True)
+    )
+
+    return move_probs, win_prob

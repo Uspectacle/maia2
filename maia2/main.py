@@ -1,141 +1,239 @@
-import chess.pgn
+# pylint: disable=too-many-lines
+"""Main training and model implementation for MAIA2.
+
+Provides core functionality including data processing, model architecture
+(ResNet + Transformer), training loop, and evaluation utilities.
+"""
+
+import threading
+from multiprocessing import Pool, Queue
+from typing import Any, Dict, List, Optional, Tuple, cast
+
 import chess
-import pdb
-from multiprocessing import Pool, cpu_count, Queue, Process
-import torch
-import tqdm
-from .utils import *
-import torch.nn as nn
-import torch.nn.functional as F
-from tqdm.contrib.concurrent import process_map
-import os
+import chess.pgn
 import pandas as pd
-import time
+import torch
+import torch.nn.functional as F
+import tqdm
 from einops import rearrange
+from torch import nn
+from tqdm.contrib.concurrent import process_map
+
+from .utils import (
+    BoardPosition,
+    ChessMove,
+    Chunk,
+    Config,
+    EloRangeDict,
+    EloRating,
+    FileOffset,
+    MovesDict,
+    board_to_tensor,
+    extract_clock_time,
+    get_side_info,
+    map_to_category,
+    mirror_move,
+)
+
+# Type aliases
+ResultScore = int
+EloPair = Tuple[EloRating, EloRating]
+DictFrequency = Dict[EloPair, int]
+TrainingPositionData = Tuple[
+    BoardPosition, ChessMove, EloRating, EloRating, ResultScore
+]
+ProcessPosition = Tuple[List[TrainingPositionData], int, DictFrequency]
+ProcessChunks = Tuple[List[ProcessPosition], int, int]
+GameResult = Tuple[chess.pgn.Game, EloRating, EloRating, ResultScore]
+ModelOutput = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+MAIA1DatasetItem = Tuple[torch.Tensor, int,
+                         int, int, torch.Tensor, torch.Tensor]
+MAIA2DatasetItem = Tuple[torch.Tensor, int,
+                         int, int, torch.Tensor, torch.Tensor, int]
 
 
-def process_chunks(cfg, pgn_path, pgn_chunks, elo_dict):
-    
+def process_chunks(
+    cfg: Config,
+    pgn_path: str,
+    pgn_chunks: List[Chunk],
+    elo_dict: EloRangeDict,
+) -> ProcessChunks:
+    """Process PGN file chunks in parallel.
+
+    Args:
+        cfg: Configuration with processing parameters.
+        pgn_path: Path to PGN file.
+        pgn_chunks: List of (start_pos, end_pos) byte positions.
+        elo_dict: Elo ratings to category indices.
+
+    Returns:
+        Tuple of (processed_positions, valid_games_count, chunks_count).
+    """
     # process_per_chunk((pgn_chunks[0][0], pgn_chunks[0][1], pgn_path, elo_dict, cfg))
-    
+
     if cfg.verbose:
-        results = process_map(process_per_chunk, [(start, end, pgn_path, elo_dict, cfg) for start, end in pgn_chunks], max_workers=len(pgn_chunks), chunksize=1)
+        results = process_map(
+            process_per_chunk,
+            [(start, end, pgn_path, elo_dict, cfg)
+             for start, end in pgn_chunks],
+            max_workers=len(pgn_chunks),
+            chunksize=1,
+        )
     else:
         with Pool(processes=len(pgn_chunks)) as pool:
-            results = pool.map(process_per_chunk, [(start, end, pgn_path, elo_dict, cfg) for start, end in pgn_chunks])
-    
-    ret = []
+            results = pool.map(
+                process_per_chunk,
+                [(start, end, pgn_path, elo_dict, cfg)
+                 for start, end in pgn_chunks],
+            )
+
+    ret: List[ProcessPosition] = []
     count = 0
-    list_of_dicts = []
+    list_of_dicts: List[DictFrequency] = []
     for result, game_count, frequency in results:
         ret.extend(result)
         count += game_count
         list_of_dicts.append(frequency)
-    
-    total_counts = {}
+
+    total_counts: DictFrequency = {}
 
     for d in list_of_dicts:
         for key, value in d.items():
             total_counts[key] = total_counts.get(key, 0) + value
 
     print(total_counts, flush=True)
-    
+
     return ret, count, len(pgn_chunks)
 
 
-def process_per_game(game, white_elo, black_elo, white_win, cfg):
+def process_per_game(
+    game: chess.pgn.Game,
+    white_elo: EloRating,
+    black_elo: EloRating,
+    white_win: ResultScore,
+    cfg: Config,
+) -> List[TrainingPositionData]:
+    """Extract training positions from single game.
 
-    ret = []
-    
+    Args:
+        game: Chess game with move history.
+        white_elo: White's Elo category index.
+        black_elo: Black's Elo category index.
+        white_win: Result from white's perspective (+1/0/-1).
+        cfg: Configuration with first_n_moves, clock_threshold, max_ply.
+
+    Returns:
+        List of (fen, move_uci, elo_self, elo_oppo, result) tuples.
+    """
+    ret: List[TrainingPositionData] = []
+
     board = game.board()
     moves = list(game.mainline_moves())
-    
+
     for i, node in enumerate(game.mainline()):
-        
         move = moves[i]
-        
+
         if i >= cfg.first_n_moves:
-            
             comment = node.comment
             clock_info = extract_clock_time(comment)
-            
-            if i % 2 == 0:
+
+            if i % 2 == 0:  # White to move
                 board_input = board.fen()
                 move_input = move.uci()
                 elo_self = white_elo
                 elo_oppo = black_elo
                 active_win = white_win
-
-            else:
+            else:  # Black to move
                 board_input = board.mirror().fen()
                 move_input = mirror_move(move.uci())
                 elo_self = black_elo
                 elo_oppo = white_elo
-                active_win = - white_win
+                active_win = -white_win
 
-            if clock_info > cfg.clock_threshold:
-                ret.append((board_input, move_input, elo_self, elo_oppo, active_win))
-        
+            if clock_info and clock_info > cfg.clock_threshold:
+                ret.append((board_input, move_input,
+                           elo_self, elo_oppo, active_win))
+
         board.push(move)
         if i == cfg.max_ply:
             break
-    
+
     return ret
 
 
-def game_filter(game):
-    
-    white_elo = game.headers.get("WhiteElo", "?")
-    black_elo = game.headers.get("BlackElo", "?")
+def game_filter(game: chess.pgn.Game) -> Optional[GameResult]:
+    """Filter games based on metadata and format.
+
+    Args:
+        game: Chess game with headers and moves.
+
+    Returns:
+        Tuple of (game, white_elo, black_elo, white_win) if valid, else None.
+        Returns None if game fails any criteria.
+    """
+    white_elo_str = game.headers.get("WhiteElo", "?")
+    black_elo_str = game.headers.get("BlackElo", "?")
     time_control = game.headers.get("TimeControl", "?")
     result = game.headers.get("Result", "?")
     event = game.headers.get("Event", "?")
-    
-    if white_elo == "?" or black_elo == "?" or time_control == "?" or result == "?" or event == "?":
-        return
 
-    if 'Rated' not in event:
-        return
-    
-    if 'Rapid' not in event:
-        return
-    
+    if (
+        white_elo_str == "?"
+        or black_elo_str == "?"
+        or time_control == "?"
+        or result == "?"
+        or event == "?"
+    ):
+        return None
+
+    if "Rated" not in event:
+        return None
+
+    if "Rapid" not in event:
+        return None
+
     for _, node in enumerate(game.mainline()):
-        if 'clk' not in node.comment:
-            return
-    
-    white_elo = int(white_elo)
-    black_elo = int(black_elo)
+        if "clk" not in node.comment:
+            return None
 
-    if result == '1-0':
+    white_elo = int(white_elo_str)
+    black_elo = int(black_elo_str)
+
+    if result == "1-0":
         white_win = 1
-    elif result == '0-1':
+    elif result == "0-1":
         white_win = -1
-    elif result == '1/2-1/2':
+    elif result == "1/2-1/2":
         white_win = 0
     else:
-        return
-    
+        return None
+
     return game, white_elo, black_elo, white_win
 
 
-def process_per_chunk(args):
+def process_per_chunk(
+    args: Tuple[FileOffset, FileOffset, str, EloRangeDict, Config],
+) -> ProcessPosition:
+    """Process chunk of games from PGN file.
 
+    Args:
+        args: Tuple of (start_pos, end_pos, pgn_path, elo_dict, cfg).
+
+    Returns:
+        Tuple of (position_list, game_count, frequency_dict).
+    """
     start_pos, end_pos, pgn_path, elo_dict, cfg = args
-    
-    ret = []
+
+    ret: List[TrainingPositionData] = []
     game_count = 0
-    
-    frequency = {}
-    
-    with open(pgn_path, 'r', encoding='utf-8') as pgn_file:
-        
+    frequency: DictFrequency = {}
+
+    with open(pgn_path, "r", encoding="utf-8") as pgn_file:
         pgn_file.seek(start_pos)
 
         while pgn_file.tell() < end_pos:
-            
             game = chess.pgn.read_game(pgn_file)
-            
+
             if game is None:
                 break
 
@@ -144,45 +242,68 @@ def process_per_chunk(args):
                 game, white_elo, black_elo, white_win = filtered_game
                 white_elo = map_to_category(white_elo, elo_dict)
                 black_elo = map_to_category(black_elo, elo_dict)
-                
+
+                # Ensure consistent Elo pair ordering
                 if white_elo < black_elo:
                     range_1, range_2 = black_elo, white_elo
                 else:
                     range_1, range_2 = white_elo, black_elo
-                
+
                 freq = frequency.get((range_1, range_2), 0)
                 if freq >= cfg.max_games_per_elo_range:
                     continue
-                
-                ret_per_game = process_per_game(game, white_elo, black_elo, white_win, cfg)
+
+                ret_per_game = process_per_game(
+                    game, white_elo, black_elo, white_win, cfg
+                )
                 ret.extend(ret_per_game)
-                if len(ret_per_game):
-                    
+                if len(ret_per_game) > 0:
                     if (range_1, range_2) in frequency:
                         frequency[(range_1, range_2)] += 1
                     else:
                         frequency[(range_1, range_2)] = 1
-                    
+
                     game_count += 1
-    
+
     return ret, game_count, frequency
 
 
-class MAIA1Dataset(torch.utils.data.Dataset):
-    
-    def __init__(self, data, all_moves_dict, elo_dict, cfg):
-        
+class MAIA1Dataset(torch.utils.data.Dataset[MAIA1DatasetItem]):
+    """Dataset for MAIA1 evaluation data."""
+
+    def __init__(
+        self,
+        data: pd.DataFrame,
+        all_moves_dict: MovesDict,
+        elo_dict: EloRangeDict,
+        cfg: Config,
+    ) -> None:
+        """Initialize dataset from DataFrame.
+
+        Args:
+            data: DataFrame with [board, move, active_elo, opponent_elo, white_active].
+            all_moves_dict: UCI moves to model indices.
+            elo_dict: Elo ratings to categories.
+            cfg: Configuration object.
+        """
         self.all_moves_dict = all_moves_dict
         self.cfg = cfg
         self.data = data.values.tolist()
         self.elo_dict = elo_dict
-    
-    def __len__(self):
-        
+
+    def __len__(self) -> int:
+        """Return number of positions."""
         return len(self.data)
-    
-    def __getitem__(self, idx):
-        
+
+    def __getitem__(self, idx: int) -> MAIA1DatasetItem:
+        """Get single training example.
+
+        Args:
+            idx: Position index.
+
+        Returns:
+            Tuple of (board, move_idx, elo_self, elo_oppo, legal_moves, side_info).
+        """
         fen, move, elo_self, elo_oppo, white_active = self.data[idx]
 
         if white_active:
@@ -190,60 +311,107 @@ class MAIA1Dataset(torch.utils.data.Dataset):
         else:
             board = chess.Board(fen).mirror()
             move = mirror_move(move)
-            
+
         board_input = board_to_tensor(board)
         move_input = self.all_moves_dict[move]
-        
+
         elo_self = map_to_category(elo_self, self.elo_dict)
         elo_oppo = map_to_category(elo_oppo, self.elo_dict)
-        
-        legal_moves, side_info = get_side_info(board, move, self.all_moves_dict)
-        
+
+        legal_moves, side_info = get_side_info(
+            board, move, self.all_moves_dict)
+
         return board_input, move_input, elo_self, elo_oppo, legal_moves, side_info
 
 
-class MAIA2Dataset(torch.utils.data.Dataset):
-    
-    
-    def __init__(self, data, all_moves_dict, cfg):
-        
+class MAIA2Dataset(torch.utils.data.Dataset[MAIA2DatasetItem]):
+    """Dataset for MAIA2 training data."""
+
+    def __init__(
+        self,
+        data: List[TrainingPositionData],
+        all_moves_dict: MovesDict,
+        cfg: Config,
+    ) -> None:
+        """Initialize dataset from processed games.
+
+        Args:
+            data: List of (fen, move_uci, elo_self, elo_oppo, result) tuples.
+            all_moves_dict: UCI moves to model indices.
+            cfg: Configuration object.
+        """
         self.all_moves_dict = all_moves_dict
         self.data = data
         self.cfg = cfg
-    
-    def __len__(self):
-        
+
+    def __len__(self) -> int:
+        """Return number of positions."""
         return len(self.data)
-    
-    def __getitem__(self, idx):
-        
+
+    def __getitem__(self, idx: int) -> MAIA2DatasetItem:
+        """Get single training example.
+
+        Args:
+            idx: Position index.
+
+        Returns:
+            Tuple of (board, move_idx, elo_self, elo_oppo, legal_moves, side_info, result).
+        """
         board_input, move_uci, elo_self, elo_oppo, active_win = self.data[idx]
-        
+
         board = chess.Board(board_input)
-        board_input = board_to_tensor(board)
-        
-        legal_moves, side_info = get_side_info(board, move_uci, self.all_moves_dict)
-        
+        board_input_tensor = board_to_tensor(board)
+
+        legal_moves, side_info = get_side_info(
+            board, move_uci, self.all_moves_dict)
+
         move_input = self.all_moves_dict[move_uci]
-        
-        return board_input, move_input, elo_self, elo_oppo, legal_moves, side_info, active_win
+
+        return (
+            board_input_tensor,
+            move_input,
+            elo_self,
+            elo_oppo,
+            legal_moves,
+            side_info,
+            active_win,
+        )
 
 
 class BasicBlock(torch.nn.Module):
+    """Basic residual block with dropout."""
 
-    def __init__(self, in_planes, planes, stride=1):
+    def __init__(self, in_planes: int, planes: int, stride: int = 1) -> None:
+        """Initialize block.
+
+        Args:
+            in_planes: Input channels.
+            planes: Output channels.
+            stride: Convolution stride.
+        """
         super(BasicBlock, self).__init__()
-        
+
         mid_planes = planes
-        
-        self.conv1 = torch.nn.Conv2d(in_planes, mid_planes, kernel_size=3, stride=stride, padding=1, bias=False)
+
+        self.conv1 = torch.nn.Conv2d(
+            in_planes, mid_planes, kernel_size=3, stride=stride, padding=1, bias=False
+        )
         self.bn1 = torch.nn.BatchNorm2d(mid_planes)
-        self.conv2 = torch.nn.Conv2d(mid_planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv2 = torch.nn.Conv2d(
+            mid_planes, planes, kernel_size=3, stride=1, padding=1, bias=False
+        )
         self.bn2 = torch.nn.BatchNorm2d(planes)
         self.dropout = nn.Dropout(p=0.5)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through block.
 
+        Args:
+            x: Input tensor [batch, channels, height, width].
+
+        Returns:
+            Output tensor with same shape.
+        """
         out = self.conv1(x)
         out = self.bn1(out)
         out = F.relu(out)
@@ -258,36 +426,80 @@ class BasicBlock(torch.nn.Module):
 
 
 class ChessResNet(torch.nn.Module):
-    
-    def __init__(self, block, cfg):
+    """ResNet-based CNN for chess board processing."""
+
+    def __init__(self, block: type, cfg: Config) -> None:
+        """Initialize CNN.
+
+        Args:
+            block: Residual block class.
+            cfg: Configuration with network parameters.
+        """
         super(ChessResNet, self).__init__()
-        
-        self.conv1 = torch.nn.Conv2d(cfg.input_channels, cfg.dim_cnn, kernel_size=3, stride=1, padding=1, bias=False)
+
+        self.conv1 = torch.nn.Conv2d(
+            cfg.input_channels,
+            cfg.dim_cnn,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+        )
         self.bn1 = torch.nn.BatchNorm2d(cfg.dim_cnn)
         self.layers = self._make_layer(block, cfg.dim_cnn, cfg.num_blocks_cnn)
-        self.conv_last = torch.nn.Conv2d(cfg.dim_cnn, cfg.vit_length, kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv_last = torch.nn.Conv2d(
+            cfg.dim_cnn, cfg.vit_length, kernel_size=3, stride=1, padding=1, bias=False
+        )
         self.bn_last = torch.nn.BatchNorm2d(cfg.vit_length)
 
-    def _make_layer(self, block, planes, num_blocks, stride=1):
-        
+    def _make_layer(
+        self, block: type, planes: int, num_blocks: int, stride: int = 1
+    ) -> torch.nn.Sequential:
+        """Create layer of stacked residual blocks.
+
+        Args:
+            block: Residual block class.
+            planes: Number of channels.
+            num_blocks: Number of blocks to stack.
+            stride: Convolution stride.
+
+        Returns:
+            Sequential container of blocks.
+        """
         layers = []
         for _ in range(num_blocks):
             layers.append(block(planes, planes, stride))
-        
+
         return torch.nn.Sequential(*layers)
 
-    def forward(self, x):
-        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: Input [batch, channels, 8, 8].
+
+        Returns:
+            Output [batch, vit_length, 8, 8].
+        """
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.layers(out)
         out = self.conv_last(out)
         out = self.bn_last(out)
-        
+
         return out
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dim, hidden_dim, dropout = 0.):
+    """MLP with normalization and dropout."""
+
+    def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.0) -> None:
+        """Initialize feed-forward network.
+
+        Args:
+            dim: Input/output dimension.
+            hidden_dim: Hidden layer dimension.
+            dropout: Dropout probability.
+        """
         super().__init__()
         self.net = nn.Sequential(
             nn.LayerNorm(dim),
@@ -295,68 +507,145 @@ class FeedForward(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, dim),
-            nn.Dropout(dropout)
+            nn.Dropout(dropout),
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: Input [batch, seq_len, dim].
+
+        Returns:
+            Output [batch, seq_len, dim].
+        """
         return self.net(x)
 
 
 class EloAwareAttention(nn.Module):
-    def __init__(self, dim, heads=8, dim_head=64, dropout=0., elo_dim=64):
+    """Multi-head attention with Elo conditioning."""
+
+    def __init__(
+        self,
+        dim: int,
+        heads: int = 8,
+        dim_head: int = 64,
+        dropout: float = 0.0,
+        elo_dim: int = 64,
+    ) -> None:
+        """Initialize attention layer.
+
+        Args:
+            dim: Input dimension.
+            heads: Number of attention heads.
+            dim_head: Dimension per head.
+            dropout: Dropout probability.
+            elo_dim: Elo embedding dimension.
+        """
         super().__init__()
         inner_dim = dim_head * heads
         project_out = not (heads == 1 and dim_head == dim)
 
         self.heads = heads
-        self.scale = dim_head ** -0.5
+        self.scale = dim_head**-0.5
 
         self.norm = nn.LayerNorm(dim)
-
         self.attend = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
 
         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
-
         self.elo_query = nn.Linear(elo_dim, inner_dim, bias=False)
 
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, dim),
-            nn.Dropout(dropout)
-        ) if project_out else nn.Identity()
+        self.to_out = (
+            nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
+            if project_out
+            else nn.Identity()
+        )
 
-    def forward(self, x, elo_emb):
+    def forward(self, x: torch.Tensor, elo_emb: torch.Tensor) -> torch.Tensor:
+        """Forward pass with Elo conditioning.
+
+        Args:
+            x: Input sequence [batch, seq_len, dim].
+            elo_emb: Elo embeddings [batch, elo_dim].
+
+        Returns:
+            Output [batch, seq_len, dim].
+        """
         x = self.norm(x)
 
         qkv = self.to_qkv(x).chunk(3, dim=-1)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.heads), qkv)
+        q, k, v = map(lambda t: rearrange(
+            t, "b n (h d) -> b h n d", h=self.heads), qkv)
 
+        # Condition attention with Elo
         elo_effect = self.elo_query(elo_emb).view(x.size(0), self.heads, 1, -1)
         q = q + elo_effect
 
+        # Scaled dot-product attention
         dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-
         attn = self.attend(dots)
         attn = self.dropout(attn)
 
         out = torch.matmul(attn, v)
-        out = rearrange(out, 'b h n d -> b n (h d)')
+        out = rearrange(out, "b h n d -> b n (h d)")
         return self.to_out(out)
 
 
 class Transformer(nn.Module):
-    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0., elo_dim=64):
+    """Transformer with Elo-aware attention."""
+
+    def __init__(
+        self,
+        dim: int,
+        depth: int,
+        heads: int,
+        dim_head: int,
+        mlp_dim: int,
+        dropout: float = 0.0,
+        elo_dim: int = 64,
+    ) -> None:
+        """Initialize transformer.
+
+        Args:
+            dim: Model dimension.
+            depth: Number of layers.
+            heads: Number of attention heads.
+            dim_head: Dimension per head.
+            mlp_dim: MLP hidden dimension.
+            dropout: Dropout probability.
+            elo_dim: Elo embedding dimension.
+        """
         super().__init__()
         self.norm = nn.LayerNorm(dim)
         self.layers = nn.ModuleList([])
         self.elo_layers = nn.ModuleList([])
         for _ in range(depth):
-            self.elo_layers.append(nn.ModuleList([
-                EloAwareAttention(dim, heads = heads, dim_head = dim_head, dropout = dropout, elo_dim = elo_dim),
-                FeedForward(dim, mlp_dim, dropout = dropout)
-            ]))
+            self.elo_layers.append(
+                nn.ModuleList(
+                    [
+                        EloAwareAttention(
+                            dim,
+                            heads=heads,
+                            dim_head=dim_head,
+                            dropout=dropout,
+                            elo_dim=elo_dim,
+                        ),
+                        FeedForward(dim, mlp_dim, dropout=dropout),
+                    ]
+                )
+            )
 
-    def forward(self, x, elo_emb):
+    def forward(self, x: torch.Tensor, elo_emb: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: Input [batch, seq_len, dim].
+            elo_emb: Elo embeddings [batch, elo_dim].
+
+        Returns:
+            Output [batch, seq_len, dim].
+        """
         for attn, ff in self.elo_layers:
             x = attn(x, elo_emb) + x
             x = ff(x) + x
@@ -365,108 +654,177 @@ class Transformer(nn.Module):
 
 
 class MAIA2Model(torch.nn.Module):
-    
-    def __init__(self, output_dim, elo_dict, cfg):
+    """MAIA2 chess move prediction model.
+
+    Hybrid CNN-Transformer with Elo-aware attention for move prediction.
+    """
+
+    def __init__(self, output_dim: int, elo_dict: EloRangeDict, cfg: Config) -> None:
+        """Initialize MAIA2 model.
+
+        Args:
+            output_dim: Number of possible moves.
+            elo_dict: Elo ranges to indices.
+            cfg: Configuration with model parameters.
+        """
         super(MAIA2Model, self).__init__()
-        
+
         self.cfg = cfg
         self.chess_cnn = ChessResNet(BasicBlock, cfg)
-        
+
         heads = 16
         dim_head = 64
         self.to_patch_embedding = nn.Sequential(
             nn.Linear(8 * 8, cfg.dim_vit),
             nn.LayerNorm(cfg.dim_vit),
         )
-        self.transformer = Transformer(cfg.dim_vit, cfg.num_blocks_vit, heads, dim_head, mlp_dim=cfg.dim_vit, dropout = 0.1, elo_dim = cfg.elo_dim * 2)
-        self.pos_embedding = nn.Parameter(torch.randn(1, cfg.vit_length, cfg.dim_vit))
-        
+        self.transformer = Transformer(
+            cfg.dim_vit,
+            cfg.num_blocks_vit,
+            heads,
+            dim_head,
+            mlp_dim=cfg.dim_vit,
+            dropout=0.1,
+            elo_dim=cfg.elo_dim * 2,
+        )
+        self.pos_embedding = nn.Parameter(
+            torch.randn(1, cfg.vit_length, cfg.dim_vit))
+
+        # Output heads
         self.fc_1 = nn.Linear(cfg.dim_vit, output_dim)
         # self.fc_1_1 = nn.Linear(cfg.dim_vit, cfg.dim_vit)
         self.fc_2 = nn.Linear(cfg.dim_vit, output_dim + 6 + 6 + 1 + 64 + 64)
         # self.fc_2_1 = nn.Linear(cfg.dim_vit, cfg.dim_vit)
         self.fc_3 = nn.Linear(128, 1)
         self.fc_3_1 = nn.Linear(cfg.dim_vit, 128)
-        
+
         self.elo_embedding = torch.nn.Embedding(len(elo_dict), cfg.elo_dim)
-        
         self.dropout = nn.Dropout(p=0.1)
         self.last_ln = nn.LayerNorm(cfg.dim_vit)
 
+    def forward(
+        self, boards: torch.Tensor, elos_self: torch.Tensor, elos_oppo: torch.Tensor
+    ) -> ModelOutput:
+        """Forward pass.
 
-    def forward(self, boards, elos_self, elos_oppo):
-        
+        Args:
+            boards: Board tensors [batch, channels, 8, 8].
+            elos_self: Player Elo indices [batch].
+            elos_oppo: Opponent Elo indices [batch].
+
+        Returns:
+            Tuple of (move_logits, side_info_logits, value_logits).
+        """
         batch_size = boards.size(0)
         boards = boards.view(batch_size, self.cfg.input_channels, 8, 8)
+
+        # Process board with CNN
         embs = self.chess_cnn(boards)
         embs = embs.view(batch_size, embs.size(1), 8 * 8)
         x = self.to_patch_embedding(embs)
         x += self.pos_embedding
         x = self.dropout(x)
-        
+
+        # Combine Elo embeddings and process
         elos_emb_self = self.elo_embedding(elos_self)
         elos_emb_oppo = self.elo_embedding(elos_oppo)
         elos_emb = torch.cat((elos_emb_self, elos_emb_oppo), dim=1)
         x = self.transformer(x, elos_emb).mean(dim=1)
-        
         x = self.last_ln(x)
 
+        # Generate predictions
         logits_maia = self.fc_1(x)
         logits_side_info = self.fc_2(x)
-        logits_value = self.fc_3(self.dropout(torch.relu(self.fc_3_1(x)))).squeeze(dim=-1)
-        
+        logits_value = self.fc_3(self.dropout(torch.relu(self.fc_3_1(x)))).squeeze(
+            dim=-1
+        )
+
         return logits_maia, logits_side_info, logits_value
 
 
-def read_monthly_data_path(cfg):
-    
-    print('Training Data:', flush=True)
-    pgn_paths = []
-    
+def read_monthly_data_path(cfg: Config) -> List[str]:
+    """Get paths to monthly PGN files in date range.
+
+    Args:
+        cfg: Configuration with start_year, end_year, start_month, end_month, data_root.
+
+    Returns:
+        List of PGN file paths.
+    """
+    print("Training Data:", flush=True)
+    pgn_paths: List[str] = []
+
     for year in range(cfg.start_year, cfg.end_year + 1):
         start_month = cfg.start_month if year == cfg.start_year else 1
         end_month = cfg.end_month if year == cfg.end_year else 12
 
         for month in range(start_month, end_month + 1):
             formatted_month = f"{month:02d}"
-            pgn_path = cfg.data_root + f"/lichess_db_standard_rated_{year}-{formatted_month}.pgn"
+            pgn_path = (
+                cfg.data_root
+                + f"/lichess_db_standard_rated_{year}-{formatted_month}.pgn"
+            )
             # skip 2019-12
             if year == 2019 and month == 12:
                 continue
             print(pgn_path, flush=True)
             pgn_paths.append(pgn_path)
-            
+
     return pgn_paths
 
 
-def evaluate(model, dataloader):
-    
+def evaluate(
+    model: MAIA2Model, dataloader: torch.utils.data.DataLoader[MAIA1DatasetItem]
+) -> Tuple[int, int]:
+    """Evaluate model accuracy on dataset.
+
+    Args:
+        model: MAIA2 model.
+        dataloader: DataLoader with evaluation data.
+
+    Returns:
+        Tuple of (correct_predictions, total_positions).
+    """
     counter = 0
     correct_move = 0
-    
+
     model.eval()
     with torch.no_grad():
-        
-        for boards, labels, elos_self, elos_oppo, legal_moves, side_info in dataloader:
-            
+        for boards, labels, elos_self, elos_oppo, legal_moves, _side_info in dataloader:
             boards = boards.cuda()
             labels = labels.cuda()
             elos_self = elos_self.cuda()
             elos_oppo = elos_oppo.cuda()
             legal_moves = legal_moves.cuda()
 
-            logits_maia, logits_side_info, logits_value = model(boards, elos_self, elos_oppo)
+            logits_maia, _logits_side_info, _logits_value = model(
+                boards, elos_self, elos_oppo
+            )
             logits_maia_legal = logits_maia * legal_moves
             preds = logits_maia_legal.argmax(dim=-1)
             correct_move += (preds == labels).sum().item()
-            
+
             counter += len(labels)
 
     return correct_move, counter
 
 
-def evaluate_MAIA1_data(model, all_moves_dict, elo_dict, cfg, tiny=False):
-    
+def evaluate_MAIA1_data(  # pylint: disable=invalid-name
+    model: MAIA2Model,
+    all_moves_dict: MovesDict,
+    elo_dict: EloRangeDict,
+    cfg: Config,
+    tiny: bool = False,
+) -> None:
+    """Evaluate model on MAIA1 test dataset.
+
+    Args:
+        model: MAIA2 model.
+        all_moves_dict: Moves to indices mapping.
+        elo_dict: Elo rating binning.
+        cfg: Configuration object.
+        tiny: Test only first Elo range if True.
+    """
     elo_list = range(1000, 2600, 100)
 
     for i in elo_list:
@@ -474,40 +832,85 @@ def evaluate_MAIA1_data(model, all_moves_dict, elo_dict, cfg, tiny=False):
         end = i + 100
         file_path = f"../data/test/KDDTest_{start}-{end}.csv"
         data = pd.read_csv(file_path)
-        data = data[data.type == 'Rapid'][['board', 'move', 'active_elo', 'opponent_elo', 'white_active']]
+        data = data[data.type == "Rapid"][
+            ["board", "move", "active_elo", "opponent_elo", "white_active"]
+        ]
         dataset = MAIA1Dataset(data, all_moves_dict, elo_dict, cfg)
-        dataloader = torch.utils.data.DataLoader(dataset, 
-                                                batch_size=cfg.batch_size, 
-                                                shuffle=False, 
-                                                drop_last=False,
-                                                num_workers=cfg.num_workers)
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=cfg.num_workers,
+        )
         if cfg.verbose:
-            dataloader = tqdm.tqdm(dataloader)
-        print(f'Testing Elo Range {start}-{end} with MAIA 1 data:', flush=True)
+            dataloader = cast(
+                torch.utils.data.DataLoader[MAIA1DatasetItem], tqdm.tqdm(
+                    dataloader)
+            )
+        print(f"Testing Elo Range {start}-{end} with MAIA 1 data:", flush=True)
         correct_move, counter = evaluate(model, dataloader)
-        print(f'Accuracy Move Prediction: {round(correct_move / counter, 4)}', flush=True)
+        print(
+            f"Accuracy Move Prediction: {round(correct_move / counter, 4)}", flush=True
+        )
         if tiny:
             break
 
 
-def train_chunks(cfg, data, model, optimizer, all_moves_dict, criterion_maia, criterion_side_info, criterion_value):
-    
-    dataset_train = MAIA2Dataset(data, all_moves_dict, cfg)
-    dataloader_train = torch.utils.data.DataLoader(dataset_train, 
-                                                    batch_size=cfg.batch_size, 
-                                                    shuffle=True, 
-                                                    drop_last=False,
-                                                    num_workers=cfg.num_workers)
-    if cfg.verbose:
-        dataloader_train = tqdm.tqdm(dataloader_train)
-    
-    avg_loss = 0
-    avg_loss_maia = 0
-    avg_loss_side_info = 0
-    avg_loss_value = 0
-    step = 0
-    for boards, labels, elos_self, elos_oppo, legal_moves, side_info, wdl in dataloader_train:
+def train_chunks(
+    cfg: Config,
+    data: List[TrainingPositionData],
+    model: torch.nn.DataParallel[MAIA2Model],
+    optimizer: torch.optim.Optimizer,
+    all_moves_dict: MovesDict,
+    criterion_maia: torch.nn.Module,
+    criterion_side_info: torch.nn.Module,
+    criterion_value: torch.nn.Module,
+) -> Tuple[float, float, float, float]:
+    """Train model on batch of game chunks.
 
+    Args:
+        cfg: Configuration with training parameters.
+        data: List of (fen, move, elos, result) tuples.
+        model: MAIA2 model.
+        optimizer: Optimizer.
+        all_moves_dict: Moves to indices.
+        criterion_maia: Move prediction loss.
+        criterion_side_info: Side info loss.
+        criterion_value: Value prediction loss.
+
+    Returns:
+        Tuple of (total_loss, move_loss, side_info_loss, value_loss).
+    """
+    dataset_train = MAIA2Dataset(data, all_moves_dict, cfg)
+    dataloader_train = torch.utils.data.DataLoader(
+        dataset_train,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        drop_last=False,
+        num_workers=cfg.num_workers,
+    )
+    if cfg.verbose:
+        dataloader_train = cast(
+            torch.utils.data.DataLoader[MAIA2DatasetItem], tqdm.tqdm(
+                dataloader_train)
+        )
+
+    avg_loss: float = 0
+    avg_loss_maia: float = 0
+    avg_loss_side_info: float = 0
+    avg_loss_value: float = 0
+    step = 0
+
+    for (
+        boards,
+        labels,
+        elos_self,
+        elos_oppo,
+        _legal_moves,
+        side_info,
+        wdl,
+    ) in dataloader_train:
         model.train()
         boards = boards.cuda()
         labels = labels.cuda()
@@ -515,26 +918,30 @@ def train_chunks(cfg, data, model, optimizer, all_moves_dict, criterion_maia, cr
         elos_oppo = elos_oppo.cuda()
         side_info = side_info.cuda()
         wdl = wdl.float().cuda()
-        
-        logits_maia, logits_side_info, logits_value = model(boards, elos_self, elos_oppo)
-        
-        loss = 0
+
+        logits_maia, logits_side_info, logits_value = model(
+            boards, elos_self, elos_oppo
+        )
+
         loss_maia = criterion_maia(logits_maia, labels)
-        loss += loss_maia
-        
+        loss = 0 + loss_maia
+
         if cfg.side_info:
-        
-            loss_side_info = criterion_side_info(logits_side_info, side_info) * cfg.side_info_coefficient
+            loss_side_info = (
+                criterion_side_info(logits_side_info, side_info)
+                * cfg.side_info_coefficient
+            )
             loss += loss_side_info
-        
+
         if cfg.value:
-            loss_value = criterion_value(logits_value, wdl) * cfg.value_coefficient
+            loss_value = criterion_value(
+                logits_value, wdl) * cfg.value_coefficient
             loss += loss_value
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        
+
         avg_loss += loss.item()
         avg_loss_maia += loss_maia.item()
         if cfg.side_info:
@@ -542,18 +949,45 @@ def train_chunks(cfg, data, model, optimizer, all_moves_dict, criterion_maia, cr
         if cfg.value:
             avg_loss_value += loss_value.item()
         step += 1
-    
-    return round(avg_loss / step, 3), round(avg_loss_maia / step, 3), round(avg_loss_side_info / step, 3), round(avg_loss_value / step, 3)
+
+    return (
+        round(avg_loss / step, 3),
+        round(avg_loss_maia / step, 3),
+        round(avg_loss_side_info / step, 3),
+        round(avg_loss_value / step, 3),
+    )
 
 
-def preprocess_thread(queue, cfg, pgn_path, pgn_chunks_sublist, elo_dict):
-    
-    data, game_count, chunk_count = process_chunks(cfg, pgn_path, pgn_chunks_sublist, elo_dict)
+def preprocess_thread(
+    queue: Queue,
+    cfg: Config,
+    pgn_path: str,
+    pgn_chunks_sublist: List[Chunk],
+    elo_dict: EloRangeDict,
+) -> None:
+    """Process PGN chunks in separate thread.
+
+    Args:
+        queue: Queue for storing results.
+        cfg: Configuration object.
+        pgn_path: Path to PGN file.
+        pgn_chunks_sublist: List of chunk positions.
+        elo_dict: Elo rating binning.
+    """
+    data, game_count, chunk_count = process_chunks(
+        cfg, pgn_path, pgn_chunks_sublist, elo_dict
+    )
     queue.put([data, game_count, chunk_count])
     del data
 
 
-def worker_wrapper(semaphore, *args, **kwargs):
+def worker_wrapper(semaphore: threading.Semaphore, *args: Any, **kwargs: Any) -> None:
+    """Thread worker with semaphore protection.
+
+    Args:
+        semaphore: Semaphore for controlling access.
+        args: Positional arguments for preprocess_thread.
+        kwargs: Keyword arguments for preprocess_thread.
+    """
     with semaphore:
         preprocess_thread(*args, **kwargs)
-
